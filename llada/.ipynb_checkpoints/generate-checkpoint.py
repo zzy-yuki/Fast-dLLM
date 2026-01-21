@@ -62,7 +62,6 @@ def get_num_transfer_tokens(block_mask_index: torch.Tensor, steps: int) -> torch
     """
     block_mask_index: (B, L) bool – which positions are masked in the current block
     returns: (B, steps) int – how many tokens to transfer at each step per batch item
-    预计算每步需要unmask的token数量
     """
     device = block_mask_index.device
     dtype = torch.long
@@ -98,31 +97,25 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
         remasking: Remasking strategy. 'low_confidence' or 'random'.
         mask_id: The toke id of [MASK] is 126336.
     '''
-    x = torch.full((prompt.shape[0], prompt.shape[1] + gen_length), #初始化生成序列：prompt + 要生成的部分（全mask）
-                   mask_id, dtype=torch.long).to(model.device)
-    x[:, :prompt.shape[1]] = prompt.clone() 
-    # 现在 x 的结构：
-    # [token1, token2, ..., tokenN, 126336, 126336, ..., 126336]
-    #  <--------- prompt ----------><------- gen_length -------->
-    #          (已知内容)                    (待生成，全是MASK)
+    x = torch.full((prompt.shape[0], prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
+    x[:, :prompt.shape[1]] = prompt.clone()
 
     assert gen_length % block_length == 0
     num_blocks = gen_length // block_length
 
     assert steps % num_blocks == 0
-    steps = steps // num_blocks #将总步数平均分配给每个块，确保每个块都用相同的步数进行去噪。
+    steps = steps // num_blocks
 
-    nfe = 0 #记录前向传播次数
+    nfe = 0
     for num_block in range(num_blocks):
-        #block_mask_index = (x[:, start:end] == mask_id) 找出当前块中哪些位置还是 [MASK] token
         block_mask_index = (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length] == mask_id)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
         i = 0
         while True:
             nfe += 1
-            mask_index = (x == mask_id)#找出整个序列中哪些位置是 [MASK] token
+            mask_index = (x == mask_id)
             logits = model(x).logits
-            mask_index[:, prompt.shape[1] + (num_block + 1) * block_length:] = 0#确保在当前块之后的位置不被考虑进行更新
+            mask_index[:, prompt.shape[1] + (num_block + 1) * block_length:] = 0
             if factor is None:
                 x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, i] if threshold is None else None, threshold)
             else:
@@ -150,7 +143,6 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
         remasking: Remasking strategy. 'low_confidence' or 'random'.
         mask_id: The toke id of [MASK] is 126336.
     '''
-    #创建完整序列，全部填充 [MASK]
     x = torch.full((prompt.shape[0], prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
 
@@ -165,22 +157,12 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
     for num_block in range(num_blocks):
         current_block_start = prompt.shape[1] + num_block * block_length
         current_block_end = current_block_start + block_length
-        
-        #找出当前块中哪些位置还是 [MASK]
+
         block_mask_index = (x[:, current_block_start:current_block_end] == mask_id)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
 
-        #对整个序列进行前向传播，启用缓存
         output = model(x, use_cache=True)
-        past_key_values = output.past_key_values #提取KV Cache
-        # 这是一个嵌套元组结构：
-        # (
-        #   layer0: (key0, value0),  # 每个 shape: (B, num_heads, 178, head_dim)
-        #   layer1: (key1, value1),
-        #   ...
-        #   layer31: (key31, value31)
-        # )
-        # 这里缓存了所有 prompt(50)+ gen_length(128) 个位置的注意力状态
+        past_key_values = output.past_key_values
 
         mask_index = (x == mask_id)
         mask_index[:, current_block_end:] = 0
@@ -190,21 +172,13 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
             x0, transfer_index = get_transfer_index_dynamic(output.logits, temperature, remasking, mask_index, x, None, factor)
         x[transfer_index] = x0[transfer_index]
 
-        #构建新的 KV Cache，只保留前缀部分
         new_past_key_values = []
-        for i in range(len(past_key_values)): #遍历每一层
+        for i in range(len(past_key_values)):
             new_past_key_values.append(())
-            for j in range(len(past_key_values[i])): # key 和 value（2个张量）
-                # **关键：只保留前缀部分 [:, :, :current_block_start]
+            for j in range(len(past_key_values[i])):
                 new_past_key_values[i] += (past_key_values[i][j][:, :, :current_block_start],)
-        # 原始 shape: (1, num_heads, 178, head_dim)
-        # 裁剪后:     (1, num_heads, current_block_start, head_dim)
-        # 例如：
-        # num_block=0: 保留 [:, :, :50] - 只有 prompt 的 KV
-        # num_block=1: 保留 [:, :, :82] - prompt + 第1块的 KV
-        # num_block=2: 保留 [:, :, :114] - prompt + 前2块的 KV       
-
-        past_key_values = new_past_key_values # 替换为裁剪后的
+        
+        past_key_values = new_past_key_values
         nfe += 1
         
         i = 1
@@ -212,21 +186,10 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
             if (x[:, current_block_start:current_block_end] == mask_id).sum() == 0:
                 break
             nfe += 1
-            # 创建 mask index（只针对当前块及之后）
-            mask_index = (x[:, current_block_start:] == mask_id) # shape: (1, 128)
-            mask_index[:, block_length:] = 0 #只有 [0:32] 位置是 True（对应第一块）
+            mask_index = (x[:, current_block_start:] == mask_id)
+            mask_index[:, block_length:] = 0
 
-            logits = model(x[:, current_block_start:], # 只传入当前块及之后的部分
-                           past_key_values=past_key_values, # 复用前缀的 KV Cache
-                           use_cache=True).logits
-            # 输入: (1, 128) - 从 current_block_start 开始
-            # 输出: logits.shape = (1, 128, vocab_size)
-            # 
-            # 模型内部的注意力计算：
-            # - Query: 来自 x[:, current_block_start:] （当前块）
-            # - Key/Value: past_key_values (前缀) + 当前计算的 KV
-            # 
-            # 关键：前缀部分 (prompt + 已完成的块) 的 KV 被复用，不重新计算
+            logits = model(x[:, current_block_start:], past_key_values=past_key_values, use_cache=True).logits
 
             logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
             x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
@@ -305,8 +268,7 @@ def generate_with_dual_cache(
             if (x[:, s:e] == mask_id).sum() == 0:
                 break
             logits_blk = model(
-                x[:, s:e], past_key_values=past_key_values, use_cache=True, 
-                replace_position=replace_position
+                x[:, s:e], past_key_values=past_key_values, use_cache=True, replace_position=replace_position
             ).logits  # shape expected by get_transfer_index*
 
             # Mask and quota for this step (all tensor ops)
@@ -349,39 +311,36 @@ def get_transfer_index(
     """
     # 1) Sample proposal x0
     # Gumbel-noise for exploration; if temperature==0, add_gumbel_noise should no-op
-    # 加 Gumbel 噪声后采样
     logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-    x0 = torch.argmax(logits_with_noise, dim=-1)  # (B, L), long #取干扰后的最大值作为预测
+    x0 = torch.argmax(logits_with_noise, dim=-1)  # (B, L), long
 
     # 2) Confidence for chosen tokens (or random)
-    # 计算置信度
     if remasking == "low_confidence":
         # Use higher precision for softmax stability
-        p = F.softmax(logits.to(torch.float64), dim=-1) #将 logits 转为概率分布（softmax）
-        x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)  # (B, L), float64 # 提取被选中的那个 token (x0) 对应的概率值
+        p = F.softmax(logits.to(torch.float64), dim=-1)
+        x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)  # (B, L), float64
+    elif remasking == "random":
         x0_p = torch.rand(x0.shape, device=x0.device, dtype=torch.float64)  # (B, L)
     else:
         raise NotImplementedError(remasking)
 
-    # Only modify masked spots; keep others as original x and set their confidence to -inf 
-    x0 = torch.where(mask_index, x0, x) # 只保留 masked 位置的预测，其他位置保持原值
+    # Only modify masked spots; keep others as original x and set their confidence to -inf
+    x0 = torch.where(mask_index, x0, x)
 
-    neg_inf = torch.tensor(torch.finfo(x0_p.dtype).min, device=x0_p.device, dtype=x0_p.dtype) # 负无穷，用于屏蔽非 masked 位置
-    confidence = torch.where(mask_index, x0_p, neg_inf)  # (B, L) #将非 masked 位置的置信度设为 -inf
+    neg_inf = torch.tensor(torch.finfo(x0_p.dtype).min, device=x0_p.device, dtype=x0_p.dtype)
+    confidence = torch.where(mask_index, x0_p, neg_inf)  # (B, L)
 
-    # 3) Pick positions to transfer (vectorized) 
-    # 是否使用阈值模式
+    # 3) Pick positions to transfer (vectorized)
     if threshold is not None:
-        # Transfer all masked positions whose confidence >= threshold 
-        # 选择所有置信度 >= threshold 的 masked 位置
+        # Transfer all masked positions whose confidence >= threshold
         # (No top-k; purely threshold-based)
         transfer_index = mask_index & (confidence >= threshold)
 
-        # at least one token is transferred "always unmask max c^i" 找到置信度最高的位置（作为兜底策略）
+        # at least one token is transferred "always unmask max c^i"
         max_conf_indices = torch.argmax(confidence, dim=1, keepdim=True) # (B, 1)
         force_mask = torch.zeros_like(transfer_index).scatter_(1, max_conf_indices, True)
 
-        # (Above Threshold) OR (Is Max Confidence) 合并两个条件
+        # (Above Threshold) OR (Is Max Confidence)
         transfer_index = transfer_index | force_mask
 
         # Safety: do not unmask something that was not masked (consider fully unmasked rows)
@@ -399,7 +358,7 @@ def get_transfer_index(
     num_transfer_tokens = num_transfer_tokens.to(dtype=torch.long, device=confidence.device)
     num_transfer_tokens = torch.clamp(num_transfer_tokens, min=0)
 
-    # 对置信度进行降序排序 Sort confidences descending (masked positions are valid; others are -inf)
+    # Sort confidences descending (masked positions are valid; others are -inf)
     # idx: (B, L) gives positions in original sequence sorted by confidence
     values, idx = torch.sort(confidence, dim=1, descending=True)
 
@@ -409,7 +368,7 @@ def get_transfer_index(
     k_expanded = num_transfer_tokens.unsqueeze(1).expand(B, L)                   # (B, L)
     select_sorted = cols < k_expanded                                            # (B, L) bool
 
-    # Scatter the sorted True/False back to original column order 将排序后的选择映射回原始位置
+    # Scatter the sorted True/False back to original column order
     # Use integer scatter then cast to bool (scatter_ on bool can be finicky across versions)
     transfer_int = torch.zeros(B, L, device=confidence.device, dtype=torch.int8) # (B, L)
     transfer_int = transfer_int.scatter(1, idx, select_sorted.to(torch.int8))
@@ -418,7 +377,7 @@ def get_transfer_index(
     return x0, transfer_index
 
 def get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, num_transfer_tokens, factor=1):
-    logits_with_noise = add_gumbel_noise(logits, temperature=temperature) #
+    logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
     x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
     if remasking == 'low_confidence':
         p = F.softmax(logits.to(torch.float64), dim=-1)
@@ -440,17 +399,14 @@ def get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, nu
         if num_tokens == 0:
             continue
         
-        # 构造递减阈值序列
-        ns = list(range(1, num_tokens + 1))           # [1, 2, ..., num_tokens]
-        es = [factor/(n+1) for n in ns]               # [factor/2, factor/3, ...]
-        threshs = [1-e for e in es]                   # [1-factor/2, 1-factor/3, ...]
+        ns=list(range(1,num_transfer_tokens[j]+1))
+        es=[factor/(n+1) for n in ns]
+        threshs=[1-e for e in es]
 
         # at least one token is transferred
-        threshs[0]=-1 # 将第1个阈值设为 -1，保证至少 unmask 1个 token
-        #只对当前样本的 masked 位置的置信度降序排序
+        threshs[0]=-1
         sorted_confidence=torch.sort(confidence[j][mask_index[j]],dim=-1,descending=True)[0]
         assert len(sorted_confidence)==len(threshs)
-        # 找到第一个不满足阈值的位置
         for top_i in range(len(threshs)):
             if sorted_confidence[top_i]<threshs[top_i]:
                 break
@@ -458,12 +414,8 @@ def get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, nu
         if top_i == 0 or top_i == len(threshs)-1:
             top_i+=1
 
-        #求出 top_i:
-        # 如果循环正常结束（没有 break），top_i 会等于 len(threshs)
-        # 如果循环提前 break，top_i 是第一个不满足的位置
-
-        _, select_index = torch.topk(confidence[j], k=top_i) # 在原始 confidence 中选择 top_i 个最高的
-        transfer_index[j, select_index] = True #将这些位置标记为需要 unmask
+        _, select_index = torch.topk(confidence[j], k=top_i)
+        transfer_index[j, select_index] = True
 
     return x0, transfer_index
 

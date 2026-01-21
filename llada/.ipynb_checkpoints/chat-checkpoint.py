@@ -45,7 +45,7 @@ def chat(args):
         if conversation_num == 0:
             prompt = input_ids
         else:
-            prompt = torch.cat([prompt, input_ids[:, 1:]], dim=1)#将上一轮对话历史 + 新问题拼接起来，但跳过开头的第一个特殊token
+            prompt = torch.cat([prompt, input_ids[:, 1:]], dim=1)
         print(f'use cache: {args.use_cache} use cache position: {args.if_cache_position} threshold: {args.threshold} block size: {args.block_size}')
         if args.use_cache:
             if args.if_cache_position:
